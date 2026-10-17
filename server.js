@@ -1,61 +1,51 @@
 /**
- * Abyss CDN Proxy — Node.js version for Render.com
+ * Abyss CDN Proxy — Node.js version for Render.com (v2 — uses upstream v13 worker)
  *
- * Uses child_process.execSync('curl ...') to fetch URLs. This is critical
- * because Node's native fetch (undici) and https.request have different
- * TLS fingerprints (JA3) than curl. Cloudflare's bot detection on
- * abysscdn.com accepts curl's TLS fingerprint but blocks Node's.
+ * ARCHITECTURE:
+ *   roku ──→  Render worker  ──→  abyss-proxy.ognoses.workers.dev  ──→  abysscdn.com
+ *   (TLS roku)   (regular curl)        (Cloudflare internal)         (CF accepts CF)
  *
- * WHY THIS EXISTS:
- *   Cloudflare workers.dev edge blocks the Roku's TLS fingerprint with a
- *   "Just a moment..." managed challenge page (HTTP 403). Render.com doesn't
- *   have this edge protection, so the Roku can reach this server directly.
- *   But this server still needs to fetch abysscdn.com — and abysscdn.com is
- *   also behind Cloudflare, which fingerprints the FETCHING client's TLS.
- *   So this server uses curl (not Node's fetch) to call abysscdn.com.
+ * The Render worker delegates /fetch to the user's existing v13 Cloudflare Worker
+ * (abyss-proxy.ognoses.workers.dev) instead of calling abysscdn.com directly.
+ *
+ * WHY THIS CHAIN WORKS:
+ *   - roku → Render: Render.com edge doesn't block roku's TLS fingerprint
+ *   - Render → v13 worker: workers.dev edge doesn't block regular curl from Render
+ *   - v13 worker → abysscdn.com: CF Workers fetch from CF's internal network,
+ *     which abysscdn.com (also on CF) accepts without challenge
+ *
+ * If we tried: roku → abyss-proxy.ognoses.workers.dev directly, the workers.dev
+ * edge would block roku's TLS fingerprint (returns "Just a moment..." 403).
+ *
+ * If we tried: roku → Render → abysscdn.com directly, abysscdn.com's CF would
+ * challenge Render's datacenter IP (also returns "Just a moment...").
+ *
+ * The 2-hop chain bypasses both edge blocks.
+ *
+ * CONFIG:
+ *   Set UPSTREAM_WORKER env var on Render.com to your v13 worker URL
+ *   (defaults to https://abyss-proxy.ognoses.workers.dev)
  *
  * ENDPOINTS:
  *   GET  /                                — health check
- *   GET  /fetch?url=<URL>                 — CORS proxy (fetches URL via curl)
+ *   GET  /fetch?url=<URL>                 — fetch via upstream v13 worker
  *   GET  /?seg0=<URL>&seg1=<URL>&frag=N&total=M
- *                                        — video range stitching (concatenates
- *                                           two segments for >512MB playback)
- *   GET  /debug?seg0=<URL>&frag=N&total=M — test origin connectivity
+ *                                        — video range stitching (via upstream)
+ *   GET  /debug?url=<URL>                 — test what upstream returns for a URL
  *   GET  /logs                            — recent request log (last 30)
  *
  * DEPLOY ON RENDER.COM:
- *   1. Push these files to a GitHub repo (public or private)
- *   2. Go to https://dashboard.render.com → New → Web Service
- *   3. Connect your GitHub repo
- *   4. Settings:
- *        - Runtime: Node
- *        - Build Command: npm install  (no deps needed; curl is pre-installed)
- *        - Start Command: npm start
- *        - Instance Type: Free
- *   5. Click "Create Web Service"
- *   6. Wait ~1-2 min for build & deploy
- *   7. Test: curl https://your-service.onrender.com/
- *      Should return: "Abyss CDN Proxy v1-render OK"
- *   8. Test the CORS proxy:
- *      curl "https://your-service.onrender.com/fetch?url=https%3A%2F%2Fabysscdn.com%2F%3Fv%3D01gE05Adb"
- *      Should return 200 + HTML containing "const datas"
+ *   1. Push server.js + package.json to your GitHub repo (overwrite existing files)
+ *   2. Render auto-redeploys on push (or manually click "Manual Deploy" →
+ *      "Clear build cache & deploy" in dashboard)
+ *   3. Wait ~1-2 min for redeploy
+ *   4. Test: curl https://your-service.onrender.com/fetch?url=https%3A%2F%2Fabysscdn.com%2F%3Fv%3D01gE05Adb
+ *      Should now return 200 + HTML containing "const datas" (NOT "Just a moment...")
  *
- * THEN IN THE ROKU APP (components/FetchTask.brs):
- *   1. Find the line near the top of tryAbyssExtraction():
- *        ABYSS_PAGE_WORKER_BASE_URL = "https://abyss-proxy.ognoses.workers.dev"
- *      Replace with:
- *        ABYSS_PAGE_WORKER_BASE_URL = "https://your-service.onrender.com"
- *   2. Find WORKER_PROXY_URL (for video range stitching):
- *        WORKER_PROXY_URL = "https://abyss-proxy.ognoses.workers.dev/"
- *      Replace with:
- *        WORKER_PROXY_URL = "https://your-service.onrender.com/"
- *   3. Rezip and side-load
- *
- * TROUBLESHOOTING:
- *   - If /fetch returns 500 with "curl not found": make sure Render's runtime
- *     is "Node" (which uses a Linux container with curl pre-installed)
- *   - If /fetch returns 403 from abysscdn.com: the curl command might be
- *     missing headers. Check /logs to see what's being requested
+ * NO APP ROKO MUDANÇA NENHUMA:
+ *   As constantes ABYSS_PAGE_WORKER_BASE_URL e WORKER_PROXY_URL continuam
+ *   apontando para https://abyss-proxy-xmxx.onrender.com — o Render worker
+ *   agora internamente delega para o v13 worker sem você precisar mudar nada.
  */
 
 const http = require('http');
@@ -63,6 +53,10 @@ const { execFileSync, execSync } = require('child_process');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
+
+// Upstream v13 worker URL — change via env var if you deploy the v13 worker
+// on a different domain. Default is the user's existing v13 worker.
+const UPSTREAM_WORKER = (process.env.UPSTREAM_WORKER || 'https://abyss-proxy.ognoses.workers.dev').replace(/\/+$/, '');
 
 // In-memory log of recent requests (for /logs endpoint)
 const requestLog = [];
@@ -81,36 +75,36 @@ function setCors(res) {
 }
 
 /**
- * Use curl to fetch a URL — curl's TLS fingerprint is accepted by Cloudflare
- * (Node's fetch/https.request are NOT, because of JA3 fingerprinting).
+ * Use curl to fetch a URL — curl's TLS fingerprint is accepted by the
+ * workers.dev edge (Node's fetch/https.request are NOT, due to JA3 fingerprinting).
  *
  * Returns: { status, contentType, body }
  */
-function curlFetch(targetUrl, { referer = 'https://embedplayabyss.top/' } = {}) {
-    // Build the curl command args
+function curlFetch(targetUrl, { referer = '', maxTime = '30' } = {}) {
     const args = [
-        '-s',                          // silent
-        '-o', '-',                     // output to stdout
-        '-w', '\n---HTTP_STATUS:%{http_code}---\n---CONTENT_TYPE:%{content_type}---\n',  // append status
-        '--compressed',                // auto-decompress
+        '-s',
+        '-o', '-',
+        '-w', '\n---HTTP_STATUS:%{http_code}---\n---CONTENT_TYPE:%{content_type}---\n',
+        '--compressed',
         '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         '-H', 'Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        '-H', `Referer: ${referer}`,
-        '--max-time', '30',            // 30s timeout
-        '-L',                          // follow redirects (max 5 by default)
+        '--max-time', maxTime,
+        '-L',
         '--max-redirs', '5',
-        targetUrl,
     ];
+    if (referer) {
+        args.push('-H', `Referer: ${referer}`);
+    }
+    args.push(targetUrl);
 
     let output;
     try {
         output = execFileSync('curl', args, {
-            maxBuffer: 200 * 1024 * 1024,  // 200MB max (for video segments)
-            timeout: 35000,
+            maxBuffer: 200 * 1024 * 1024,
+            timeout: parseInt(maxTime, 10) * 1000 + 5000,
         }).toString('utf-8');
     } catch (err) {
-        // curl failed — return error
         return {
             status: 502,
             contentType: 'application/json',
@@ -118,10 +112,8 @@ function curlFetch(targetUrl, { referer = 'https://embedplayabyss.top/' } = {}) 
         };
     }
 
-    // Parse out the status/content-type we appended
     const statusMatch = output.match(/---HTTP_STATUS:(\d+)---\n---CONTENT_TYPE:([^-\n]*)---\n?$/);
     if (!statusMatch) {
-        // Couldn't parse — return raw output as 200
         return { status: 200, contentType: 'text/html', body: output };
     }
 
@@ -133,28 +125,30 @@ function curlFetch(targetUrl, { referer = 'https://embedplayabyss.top/' } = {}) 
 }
 
 /**
- * Use curl to fetch binary data (for video segments) — returns Buffer.
+ * Use curl to fetch binary data — returns Buffer (for video segments).
  */
-function curlFetchBuffer(targetUrl, { referer = 'https://embedplayabyss.top/' } = {}) {
+function curlFetchBuffer(targetUrl, { referer = '', maxTime = '60' } = {}) {
     const args = [
         '-s',
-        '-o', '-',                     // binary output to stdout
+        '-o', '-',
         '-w', '\n---HTTP_STATUS:%{http_code}---\n---CONTENT_TYPE:%{content_type}---\n',
         '--compressed',
         '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         '-H', 'Accept: */*',
-        '-H', `Referer: ${referer}`,
-        '--max-time', '60',
+        '--max-time', maxTime,
         '-L',
         '--max-redirs', '5',
-        targetUrl,
     ];
+    if (referer) {
+        args.push('-H', `Referer: ${referer}`);
+    }
+    args.push(targetUrl);
 
     let output;
     try {
         output = execFileSync('curl', args, {
-            maxBuffer: 500 * 1024 * 1024,  // 500MB max for video segments
-            timeout: 65000,
+            maxBuffer: 500 * 1024 * 1024,
+            timeout: parseInt(maxTime, 10) * 1000 + 5000,
         });
     } catch (err) {
         return {
@@ -164,7 +158,6 @@ function curlFetchBuffer(targetUrl, { referer = 'https://embedplayabyss.top/' } 
         };
     }
 
-    // Find the boundary marker in the binary output
     const marker = '\n---HTTP_STATUS:';
     const markerIdx = output.lastIndexOf(marker, output.length - 100);
     if (markerIdx === -1) {
@@ -209,7 +202,18 @@ const server = http.createServer((req, res) => {
     if (pathname === '/' && !query.url && !query.seg0) {
         setCors(res);
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Abyss CDN Proxy v1-render OK\n\nEndpoints:\n  /                                — health check\n  /fetch?url=<URL>                 — CORS proxy (via curl)\n  /?seg0=<URL>&seg1=<URL>&frag=N&total=M — video range stitching\n  /debug?seg0=<URL>&frag=N&total=M — test connectivity\n  /logs                            — recent request log\n');
+        res.end(`Abyss CDN Proxy v2-render OK (upstream: ${UPSTREAM_WORKER})
+
+Endpoints:
+  /                                — health check
+  /fetch?url=<URL>                 — fetch via upstream v13 worker
+  /?seg0=<URL>&seg1=<URL>&frag=N&total=M — video range stitching
+  /debug?url=<URL>                 — test what upstream returns
+  /logs                            — recent request log
+
+Architecture: roku -> this Render worker -> upstream v13 worker -> abysscdn.com
+The upstream worker is on Cloudflare's network, so it can fetch abysscdn.com
+without Cloudflare's "Just a moment..." managed challenge.`);
         return;
     }
 
@@ -222,6 +226,10 @@ const server = http.createServer((req, res) => {
     }
 
     // CORS proxy: /fetch?url=<URL>
+    // v2: Delegate to the upstream v13 worker instead of fetching directly.
+    // The upstream worker is on Cloudflare's network and can fetch abysscdn.com
+    // without being challenged. We just need to call it via curl (which the
+    // workers.dev edge accepts, unlike the roku's TLS).
     if (pathname === '/fetch') {
         const targetUrl = query.url;
         if (!targetUrl) {
@@ -231,92 +239,81 @@ const server = http.createServer((req, res) => {
             return;
         }
 
-        logRequest({ endpoint: '/fetch', url: targetUrl });
-        const result = curlFetch(targetUrl);
+        // Build the upstream URL: <UPSTREAM_WORKER>/fetch?url=<encoded targetUrl>
+        const upstreamUrl = `${UPSTREAM_WORKER}/fetch?url=${encodeURIComponent(targetUrl)}`;
+        logRequest({ endpoint: '/fetch', target: targetUrl, upstream: upstreamUrl });
+
+        const result = curlFetch(upstreamUrl, { referer: 'https://embedplayabyss.top/' });
         setCors(res);
         res.writeHead(result.status, {
             'Content-Type': result.contentType || 'text/html',
             'Access-Control-Expose-Headers': '*',
+            'X-Upstream-Worker': UPSTREAM_WORKER,
         });
         res.end(result.body);
         return;
     }
 
     // Video range stitching: /?seg0=<URL>&seg1=<URL>&frag=N&total=M
+    // v2: Delegate to the upstream v13 worker's /?seg0=... endpoint.
     if (pathname === '/' && query.seg0) {
         const seg0Url = query.seg0;
         const seg1Url = query.seg1;
         const frag = query.frag;
         const total = query.total;
 
-        logRequest({ endpoint: '/range-stitch', seg0: seg0Url, seg1: seg1Url, frag, total });
+        // Build the upstream URL with the same query string
+        const upstreamQuery = new URLSearchParams({
+            seg0: seg0Url,
+            ...(seg1Url ? { seg1: seg1Url } : {}),
+            ...(frag ? { frag } : {}),
+            ...(total ? { total } : {}),
+        }).toString();
+        const upstreamUrl = `${UPSTREAM_WORKER}/?${upstreamQuery}`;
 
-        if (!seg1Url) {
-            // Single segment — fetch and pass through as binary
-            const result = curlFetchBuffer(seg0Url);
-            setCors(res);
-            res.writeHead(result.status, {
-                'Content-Type': result.contentType || 'video/mp4',
-                'Content-Length': String(result.body.length),
-                'Access-Control-Expose-Headers': '*',
-                'Cache-Control': 'no-store',
-                'X-Frag-Index': String(frag || ''),
-                'X-Total-Frags': String(total || ''),
-            });
-            res.end(result.body);
-            return;
-        }
+        logRequest({
+            endpoint: '/range-stitch',
+            seg0: seg0Url,
+            seg1: seg1Url,
+            frag,
+            total,
+            upstream: upstreamUrl,
+        });
 
-        // Two segments — fetch both in parallel, concatenate, return as one response
-        // Note: child_process.execFileSync is sync; for parallel we'd need execFile with callbacks
-        // For simplicity, fetch sequentially here (perf hit but works correctly)
-        const seg0Result = curlFetchBuffer(seg0Url);
-        if (seg0Result.status !== 200) {
-            setCors(res);
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                error: 'seg0 fetch failed',
-                seg0_status: seg0Result.status,
-            }));
-            return;
-        }
-        const seg1Result = curlFetchBuffer(seg1Url);
-        if (seg1Result.status !== 200) {
-            setCors(res);
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                error: 'seg1 fetch failed',
-                seg1_status: seg1Result.status,
-            }));
-            return;
-        }
-
-        const totalSize = seg0Result.body.length + seg1Result.body.length;
+        const result = curlFetchBuffer(upstreamUrl, { referer: 'https://embedplayabyss.top/', maxTime: '120' });
         setCors(res);
-        res.writeHead(200, {
-            'Content-Type': seg0Result.contentType || 'video/mp4',
-            'Content-Length': String(totalSize),
+        res.writeHead(result.status, {
+            'Content-Type': result.contentType || 'video/mp4',
+            'Content-Length': String(result.body.length),
             'Access-Control-Expose-Headers': '*',
             'Cache-Control': 'no-store',
             'X-Frag-Index': String(frag || ''),
             'X-Total-Frags': String(total || ''),
+            'X-Upstream-Worker': UPSTREAM_WORKER,
         });
-        res.end(Buffer.concat([seg0Result.body, seg1Result.body]));
+        res.end(result.body);
         return;
     }
 
-    // Debug endpoint: test origin connectivity
-    if (pathname === '/debug' && query.seg0) {
-        logRequest({ endpoint: '/debug', url: query.seg0 });
-        const result = curlFetch(query.seg0);
+    // Debug endpoint: test what upstream returns for a URL
+    if (pathname === '/debug' && query.url) {
+        const targetUrl = query.url;
+        const upstreamUrl = `${UPSTREAM_WORKER}/fetch?url=${encodeURIComponent(targetUrl)}`;
+        logRequest({ endpoint: '/debug', target: targetUrl, upstream: upstreamUrl });
+
+        const result = curlFetch(upstreamUrl, { referer: 'https://embedplayabyss.top/' });
         setCors(res);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            url: query.seg0,
-            status: result.status,
-            content_type: result.contentType,
+            target_url: targetUrl,
+            upstream_worker: UPSTREAM_WORKER,
+            upstream_url_called: upstreamUrl,
+            upstream_status: result.status,
+            upstream_content_type: result.contentType,
             body_length: result.body.length,
-            first_200_chars: result.body.slice(0, 200),
+            first_300_chars: result.body.slice(0, 300),
+            looks_like_cf_challenge: result.body.includes('Just a moment') || result.body.includes('cloudflare'),
+            has_datas_variable: result.body.includes('const datas') || result.body.includes('eyJzbHVn'),
         }, null, 2));
         return;
     }
@@ -328,10 +325,10 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`Abyss proxy listening on port ${PORT}`);
+    console.log(`Abyss proxy v2 listening on port ${PORT}`);
+    console.log(`Upstream worker: ${UPSTREAM_WORKER}`);
     console.log(`Health check: http://localhost:${PORT}/`);
     console.log(`CORS proxy:   http://localhost:${PORT}/fetch?url=<URL>`);
-    // Verify curl is available
     try {
         const version = execSync('curl --version').toString().split('\n')[0];
         console.log(`curl available: ${version}`);
